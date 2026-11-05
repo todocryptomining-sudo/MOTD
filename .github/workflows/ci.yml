@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-test:
+    name: ShellCheck + smoke tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+
+      - name: ShellCheck
+        run: shellcheck install.sh motd/00-miner-ai tests/smoke.sh
+
+      - name: Bash syntax
+        run: |
+          bash -n install.sh
+          bash -n motd/00-miner-ai
+          bash -n tests/smoke.sh
+
+      - name: Smoke tests
+        run: bash tests/smoke.sh
+
+  installer:
+    name: Install / uninstall roundtrip
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install (keep stock MOTD scripts)
+        run: sudo ./install.sh --keep-defaults
+
+      - name: Verify installation
+        run: |
+          test -x /etc/update-motd.d/00-miner-ai
+          grep -Fqx '# MINER_AI_MOTD' /etc/update-motd.d/00-miner-ai
+
+      - name: Reinstall (idempotent)
+        run: sudo ./install.sh --keep-defaults
+
+      - name: Uninstall
+        run: sudo ./install.sh --uninstall
+
+      - name: Verify removal
+        run: test ! -e /etc/update-motd.d/00-miner-ai
+
+  stock-motd:
+    name: Stock MOTD disable / restore
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install (disable cosmetic stock scripts)
+        run: sudo ./install.sh
+
+      - name: Check they are disabled
+        run: |
+          for f in 00-header 10-help-text 50-motd-news 90-updates-available 91-contract-ua-esm-status; do
+            if [ -e "/etc/update-motd.d/$f" ]; then
+              test ! -x "/etc/update-motd.d/$f"
+            fi
+          done
+
+      - name: Uninstall (restore stock scripts)
+        run: sudo ./install.sh --uninstall
+
+      - name: Check they are restored
+        run: |
+          for f in 00-header 10-help-text 50-motd-news 90-updates-available 91-contract-ua-esm-status; do
+            if [ -e "/etc/update-motd.d/$f" ]; then
+              test -x "/etc/update-motd.d/$f"
+            fi
+          done
