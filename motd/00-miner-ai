@@ -1,0 +1,702 @@
+#!/bin/bash
+# MINER_AI_MOTD
+# Banner dinámico para hosts GPU (Vast.ai / Ubuntu Server).
+#
+# Instalado por: https://github.com/todocryptomining-sudo/miner-ai-motd
+# Destino:       /etc/update-motd.d/00-miner-ai
+#
+# Este script se ejecuta en cada inicio de sesión a través de update-motd.
+# No usa `set -e`: si nvidia-smi, Docker o Vast.ai no están disponibles,
+# el banner debe mostrarse igualmente con el resto de los datos.
+
+# PATH fijo: los scripts de update-motd se ejecutan en un entorno mínimo.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export LC_ALL=C
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ajustes opcionales (variables de entorno)
+# ─────────────────────────────────────────────────────────────────────────────
+TITLE="${MINER_MOTD_TITLE:-MINER AI | GPU HOST}"
+WIDTH="${MINER_MOTD_WIDTH:-44}"
+DISK_PATH="${MINER_MOTD_DISK_PATH:-/}"
+
+if [[ ! $WIDTH =~ ^[0-9]+$ ]]; then
+    WIDTH=44
+fi
+# Evita que bash interprete valores como 08/09 como octal.
+WIDTH=$((10#$WIDTH))
+if (( WIDTH < 34 )); then
+    WIDTH=34
+fi
+if (( WIDTH > 100 )); then
+    WIDTH=100
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Color
+# ─────────────────────────────────────────────────────────────────────────────
+USE_COLOR=0
+case "${MINER_MOTD_COLOR:-auto}" in
+    always|1|yes|true|on) USE_COLOR=1 ;;
+    never|0|no|false|off) USE_COLOR=0 ;;
+    *)
+        if [[ -z ${NO_COLOR:-} && ${TERM:-dumb} != dumb && -t 1 ]]; then
+            USE_COLOR=1
+        fi
+        ;;
+esac
+
+if (( USE_COLOR )); then
+    NC=$'\033[0m'
+    BOLD=$'\033[1m'
+    DIM=$'\033[2m'
+    CYAN=$'\033[36m'
+    GREEN=$'\033[32m'
+    YELLOW=$'\033[33m'
+    RED=$'\033[31m'
+    WHITE=$'\033[97m'
+else
+    NC=''
+    BOLD=''
+    DIM=''
+    CYAN=''
+    GREEN=''
+    YELLOW=''
+    RED=''
+    WHITE=''
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Glifos (MINER_MOTD_ASCII=1 fuerza bordes ASCII)
+# ─────────────────────────────────────────────────────────────────────────────
+if [[ ${MINER_MOTD_ASCII:-0} == 1 ]]; then
+    TL='+'
+    TR='+'
+    BL='+'
+    BR='+'
+    H='-'
+    V='|'
+    RULE='-'
+    DOT='*'
+else
+    TL='╔'
+    TR='╗'
+    BL='╚'
+    BR='╝'
+    H='═'
+    V='║'
+    RULE='─'
+    DOT='●'
+fi
+
+FRAME_WIDTH=$WIDTH
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Utilidades de presentación
+# ─────────────────────────────────────────────────────────────────────────────
+repeat_char() {
+    local char=$1
+    local count=$2
+    local out=''
+    while (( count > 0 )); do
+        out+=$char
+        count=$((count - 1))
+    done
+    printf '%s' "$out"
+}
+
+print_banner() {
+    local title_len=${#TITLE}
+    local inner=$WIDTH
+    local horizontal pad left right lpad rpad
+
+    if (( title_len + 4 > inner )); then
+        inner=$((title_len + 4))
+    fi
+    FRAME_WIDTH=$inner
+
+    horizontal=$(repeat_char "$H" "$inner")
+    pad=$((inner - title_len))
+    left=$((pad / 2))
+    right=$((pad - left))
+    printf -v lpad '%*s' "$left" ''
+    printf -v rpad '%*s' "$right" ''
+
+    printf '%s%s%s%s%s\n' \
+        "$CYAN" "$TL" "$horizontal" "$TR" "$NC"
+    printf '%s%s%s%s%s%s%s%s%s\n' \
+        "$CYAN" "$V" "$NC" "${BOLD}${WHITE}" "$lpad$TITLE$rpad" "$NC" \
+        "$CYAN" "$V" "$NC"
+    printf '%s%s%s%s%s\n' \
+        "$CYAN" "$BL" "$horizontal" "$BR" "$NC"
+}
+
+print_section() {
+    local title=$1
+    local len=${#title}
+    local fill=$((FRAME_WIDTH - len - 2))
+    local left right
+
+    if (( fill < 4 )); then
+        fill=4
+    fi
+    left=$((fill / 2))
+    right=$((fill - left))
+
+    printf '\n  %s%s%s %s%s%s %s%s%s\n\n' \
+        "$DIM" "$(repeat_char "$RULE" "$left")" "$NC" \
+        "${BOLD}${CYAN}" "$title" "$NC" \
+        "$DIM" "$(repeat_char "$RULE" "$right")" "$NC"
+}
+
+field_plain() {
+    local label=$1
+    local value=${2:-N/D}
+    local color=${3:-$WHITE}
+    printf '  %s%-10s%s %s: %s%s%s\n' \
+        "$DIM" "$label" "$NC" "$DIM" "$color" "$value" "$NC"
+}
+
+field_raw() {
+    local label=$1
+    local value=${2:-N/D}
+    printf '  %s%-10s%s %s: %s\n' \
+        "$DIM" "$label" "$NC" "$DIM" "$value"
+}
+
+pct_color() {
+    local pct=${1:-0}
+    if [[ $pct =~ ^[0-9]+$ ]]; then
+        if (( pct >= 90 )); then
+            printf '%s' "$RED"
+        elif (( pct >= 70 )); then
+            printf '%s' "$YELLOW"
+        else
+            printf '%s' "$GREEN"
+        fi
+    else
+        printf '%s' "$WHITE"
+    fi
+}
+
+temp_color() {
+    local temp=${1:-0}
+    if [[ $temp =~ ^[0-9]+$ ]]; then
+        if (( temp >= 85 )); then
+            printf '%s' "$RED"
+        elif (( temp >= 70 )); then
+            printf '%s' "$YELLOW"
+        else
+            printf '%s' "$GREEN"
+        fi
+    else
+        printf '%s' "$WHITE"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Comandos con límite de tiempo (evita que el login se quede colgado)
+# ─────────────────────────────────────────────────────────────────────────────
+run_limited() {
+    local seconds=$1
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$seconds" "$@" 2>/dev/null
+    else
+        "$@" 2>/dev/null
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sistema, host y usuario
+# ─────────────────────────────────────────────────────────────────────────────
+collect_os() {
+    OS_LABEL='Linux'
+
+    if [[ -n ${MINER_MOTD_SYSTEM:-} ]]; then
+        OS_LABEL=$MINER_MOTD_SYSTEM
+        return
+    fi
+
+    if [[ -r /etc/os-release ]]; then
+        OS_LABEL=$(
+            # shellcheck disable=SC1091
+            . /etc/os-release
+            if [[ ${ID:-} == ubuntu && -n ${VERSION_ID:-} ]]; then
+                printf 'Ubuntu Server %s LTS' "$VERSION_ID"
+            elif [[ -n ${PRETTY_NAME:-} ]]; then
+                printf '%s' "$PRETTY_NAME"
+            elif [[ -n ${NAME:-} ]]; then
+                printf '%s' "$NAME"
+            else
+                printf 'Linux'
+            fi
+        )
+    elif [[ -r /etc/lsb-release ]]; then
+        OS_LABEL=$(
+            # shellcheck disable=SC1091
+            . /etc/lsb-release
+            if [[ -n ${DISTRIB_DESCRIPTION:-} ]]; then
+                printf '%s' "$DISTRIB_DESCRIPTION"
+            else
+                printf 'Linux'
+            fi
+        )
+    fi
+}
+
+collect_identity() {
+    HOST_NAME=$(hostname -s 2>/dev/null || uname -n 2>/dev/null)
+    if [[ -z $HOST_NAME ]]; then
+        HOST_NAME='desconocido'
+    fi
+
+    local login_user=''
+    login_user=$(logname 2>/dev/null) || login_user=''
+    if [[ -z $login_user ]]; then
+        login_user=${SUDO_USER:-}
+    fi
+    if [[ -z $login_user ]]; then
+        login_user=${USER:-}
+    fi
+    if [[ -z $login_user ]]; then
+        login_user=$(id -un 2>/dev/null)
+    fi
+    CURRENT_USER=${login_user:-desconocido}
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CPU
+# ─────────────────────────────────────────────────────────────────────────────
+read_cpu_sample() {
+    awk '/^cpu / {
+        print ($2+$3+$4+$5+$6+$7+$8+$9), ($5+$6)
+        exit
+    }' /proc/stat 2>/dev/null
+}
+
+collect_cpu() {
+    CPU_VALUE='N/D'
+    CPU_PCT=''
+    CORES=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || printf '?')
+
+    local first second t1 i1 t2 i2 total_delta idle_delta core_label
+    first=$(read_cpu_sample)
+    if [[ -z $first ]]; then
+        return
+    fi
+    read -r t1 i1 <<< "$first"
+
+    sleep 0.25 2>/dev/null || sleep 1
+
+    second=$(read_cpu_sample)
+    if [[ -z $second ]]; then
+        return
+    fi
+    read -r t2 i2 <<< "$second"
+
+    if [[ ! $t1 =~ ^[0-9]+$ || ! $t2 =~ ^[0-9]+$ ]]; then
+        return
+    fi
+
+    total_delta=$((t2 - t1))
+    idle_delta=$((i2 - i1))
+    if (( total_delta <= 0 )); then
+        return
+    fi
+
+    CPU_PCT=$(( (total_delta - idle_delta) * 100 / total_delta ))
+    if (( CPU_PCT < 0 )); then
+        CPU_PCT=0
+    fi
+    if (( CPU_PCT > 100 )); then
+        CPU_PCT=100
+    fi
+
+    core_label='núcleos'
+    if [[ $CORES == 1 ]]; then
+        core_label='núcleo'
+    fi
+    CPU_VALUE="${CPU_PCT}% (${CORES} ${core_label})"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RAM
+# ─────────────────────────────────────────────────────────────────────────────
+collect_ram() {
+    RAM_VALUE='N/D'
+    RAM_PCT=''
+    local total avail out
+
+    total=$(awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo 2>/dev/null)
+    avail=$(awk '/^MemAvailable:/ { print $2; exit }' /proc/meminfo 2>/dev/null)
+
+    if [[ -z $avail ]]; then
+        avail=$(awk '
+            /^MemFree:/ { free=$2 }
+            /^Buffers:/ { buffers=$2 }
+            /^Cached:/  { cached=$2 }
+            END {
+                if (free == "") free=0
+                if (buffers == "") buffers=0
+                if (cached == "") cached=0
+                print free + buffers + cached
+            }' /proc/meminfo 2>/dev/null)
+    fi
+
+    if [[ ! $total =~ ^[0-9]+$ || ! $avail =~ ^[0-9]+$ ]]; then
+        return
+    fi
+    if (( total <= 0 )); then
+        return
+    fi
+
+    out=$(awk -v t="$total" -v a="$avail" 'BEGIN {
+        used = t - a
+        if (used < 0) used = 0
+        printf "%.1f GiB / %.1f GiB|%d", used/1048576, t/1048576, (used*100)/t
+    }')
+
+    RAM_VALUE=${out%|*}
+    RAM_PCT=${out##*|}
+    if [[ -n $RAM_PCT ]]; then
+        RAM_VALUE+=" (${RAM_PCT}%)"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GPU (nvidia-smi)
+# ─────────────────────────────────────────────────────────────────────────────
+collect_gpu() {
+    GPU_DETECTED=0
+    GPU_NAME='No detectada'
+    GPU_COUNT=0
+    GPU_TEMP=''
+    GPU_TEMP_VALUE='N/D'
+    GPU_DRAW=''
+    GPU_LIMIT=''
+    GPU_POWER='N/D'
+
+    local out='' parsed=''
+
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        out=$(run_limited 2 nvidia-smi \
+            --query-gpu=name,temperature.gpu,power.draw,power.limit \
+            --format=csv,noheader,nounits)
+
+        # Algunos drivers antiguos no soportan power.draw/power.limit.
+        if [[ -z $out ]]; then
+            out=$(run_limited 2 nvidia-smi \
+                --query-gpu=name,temperature.gpu \
+                --format=csv,noheader,nounits)
+        fi
+
+        if [[ -n $out ]]; then
+            GPU_DETECTED=1
+            parsed=$(printf '%s\n' "$out" | awk -F',' '
+                function trim(s) {
+                    gsub(/^[ \t\r]+|[ \t\r]+$/, "", s)
+                    return s
+                }
+                {
+                    name = trim($1)
+                    temp = trim($2)
+                    draw = trim($3)
+                    limit = trim($4)
+
+                    n++
+                    if (n == 1) first = name
+
+                    if (temp ~ /^[0-9]+([.][0-9]+)?$/ && temp+0 > maxt) {
+                        maxt = temp+0
+                        has_temp = 1
+                    }
+                    if (draw ~ /^[0-9]+([.][0-9]+)?$/) {
+                        sum_draw += draw+0
+                        has_draw = 1
+                    }
+                    if (limit ~ /^[0-9]+([.][0-9]+)?$/) {
+                        sum_limit += limit+0
+                        has_limit = 1
+                    }
+                }
+                END {
+                    printf "%s|%d|", first, n
+                    if (has_temp) printf "%.0f", maxt
+                    printf "|"
+                    if (has_draw) printf "%.0f", sum_draw
+                    printf "|"
+                    if (has_limit) printf "%.0f", sum_limit
+                }')
+
+            IFS='|' read -r GPU_NAME GPU_COUNT GPU_TEMP GPU_DRAW GPU_LIMIT <<< "$parsed"
+
+            if [[ -z $GPU_NAME ]]; then
+                GPU_NAME='NVIDIA GPU'
+            fi
+            if [[ -n $GPU_TEMP ]]; then
+                GPU_TEMP_VALUE="${GPU_TEMP} °C"
+            fi
+            if [[ -n $GPU_DRAW && -n $GPU_LIMIT ]]; then
+                GPU_POWER="${GPU_DRAW} W / ${GPU_LIMIT} W"
+            elif [[ -n $GPU_DRAW ]]; then
+                GPU_POWER="${GPU_DRAW} W"
+            fi
+        fi
+    fi
+
+    # Aunque nvidia-smi falte, el dispositivo puede estar presente.
+    if (( ! GPU_DETECTED )); then
+        if [[ -e /dev/nvidia0 || -r /proc/driver/nvidia/version ]]; then
+            GPU_DETECTED=1
+            GPU_NAME='NVIDIA GPU'
+        fi
+    fi
+
+    if (( GPU_DETECTED )) && (( GPU_COUNT > 1 )); then
+        GPU_NAME+=" (x${GPU_COUNT})"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Disco
+# ─────────────────────────────────────────────────────────────────────────────
+human_kb() {
+    awk -v k="$1" 'BEGIN {
+        if (k >= 1073741824)      printf "%.1fT", k/1073741824
+        else if (k >= 1048576)    printf "%.0fG", k/1048576
+        else if (k >= 1024)       printf "%.0fM", k/1024
+        else                      printf "%dK", k
+    }'
+}
+
+collect_disk() {
+    DISK_VALUE='N/D'
+    DISK_PCT=''
+    local avail size pct free_h total_h
+
+    read -r avail size pct <<< "$(df -Pk "$DISK_PATH" 2>/dev/null | awk 'NR==2 { print $(NF-2), $(NF-4), $(NF-1); exit }')"
+
+    if [[ ! $avail =~ ^[0-9]+$ || ! $size =~ ^[0-9]+$ ]]; then
+        return
+    fi
+
+    DISK_PCT=${pct%\%}
+    if [[ ! $DISK_PCT =~ ^[0-9]+$ ]]; then
+        DISK_PCT=''
+    fi
+
+    free_h=$(human_kb "$avail")
+    total_h=$(human_kb "$size")
+    DISK_VALUE="${free_h} libres de ${total_h}"
+    if [[ -n $DISK_PCT ]]; then
+        DISK_VALUE+=" (${DISK_PCT}% usado)"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Uptime
+# ─────────────────────────────────────────────────────────────────────────────
+collect_uptime() {
+    UPTIME_VALUE='N/D'
+    local up='' d h m out=''
+
+    read -r up _ < /proc/uptime 2>/dev/null || true
+    up=${up%%.*}
+    if [[ ! $up =~ ^[0-9]+$ ]]; then
+        return
+    fi
+
+    d=$((up / 86400))
+    h=$(((up % 86400) / 3600))
+    m=$(((up % 3600) / 60))
+
+    if (( d > 0 )); then
+        out="$d día"
+        if (( d != 1 )); then
+            out+='s'
+        fi
+    fi
+
+    if (( h > 0 )); then
+        if [[ -n $out ]]; then
+            out+=', '
+        fi
+        out+="$h hora"
+        if (( h != 1 )); then
+            out+='s'
+        fi
+    fi
+
+    if (( m > 0 || ${#out} == 0 )); then
+        if [[ -n $out ]]; then
+            out+=', '
+        fi
+        if (( m == 0 )); then
+            out+='< 1 minuto'
+        else
+            out+="$m minuto"
+            if (( m != 1 )); then
+                out+='s'
+            fi
+        fi
+    fi
+
+    UPTIME_VALUE=$out
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Servicios
+# ─────────────────────────────────────────────────────────────────────────────
+systemd_is_active() {
+    local unit=$1
+    if [[ ! -d /run/systemd/system ]]; then
+        return 1
+    fi
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return 1
+    fi
+    run_limited 2 systemctl is-active --quiet "$unit"
+}
+
+docker_is_active() {
+    if systemd_is_active docker; then
+        return 0
+    fi
+    if command -v docker >/dev/null 2>&1; then
+        if run_limited 2 docker info >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+    if [[ -S /var/run/docker.sock ]]; then
+        return 0
+    fi
+    return 1
+}
+
+vast_is_active() {
+    local unit names
+
+    for unit in vastai_kaalia.service vastai-kaalia.service vastai.service vast-ai.service; do
+        if systemd_is_active "$unit"; then
+            return 0
+        fi
+    done
+
+    if command -v docker >/dev/null 2>&1; then
+        names=$(run_limited 2 docker ps --format '{{.Names}}') || names=''
+        if [[ -n $names ]] && grep -qiE 'vast|kaalia' <<< "$names"; then
+            return 0
+        fi
+    fi
+
+    if command -v pgrep >/dev/null 2>&1; then
+        if pgrep -af '(vastai_kaalia|vastai|vast-ai|kaalia)' >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+nvidia_is_detected() {
+    if (( GPU_DETECTED )); then
+        return 0
+    fi
+    if [[ -e /dev/nvidia0 || -r /proc/driver/nvidia/version ]]; then
+        return 0
+    fi
+    return 1
+}
+
+status_line() {
+    local label=$1
+    local state=$2
+    local text=$3
+    local color=$RED
+
+    if [[ $state == up ]]; then
+        color=$GREEN
+    fi
+    field_raw "$label" "${color}${DOT} ${text}${NC}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Recolección y render
+# ─────────────────────────────────────────────────────────────────────────────
+collect_os
+collect_identity
+collect_cpu
+collect_ram
+collect_gpu
+collect_disk
+collect_uptime
+
+print_banner
+printf '\n'
+
+field_plain 'Sistema' "$OS_LABEL"
+field_plain 'Host' "$HOST_NAME"
+field_plain 'Usuario' "$CURRENT_USER"
+
+print_section 'ESTADO DEL SERVIDOR'
+
+if [[ -n $CPU_PCT ]]; then
+    field_plain 'CPU' "$CPU_VALUE" "$(pct_color "$CPU_PCT")"
+else
+    field_plain 'CPU' "$CPU_VALUE" "$DIM"
+fi
+
+if [[ -n $RAM_PCT ]]; then
+    field_plain 'RAM' "$RAM_VALUE" "$(pct_color "$RAM_PCT")"
+else
+    field_plain 'RAM' "$RAM_VALUE" "$DIM"
+fi
+
+if (( GPU_DETECTED )); then
+    field_plain 'GPU' "$GPU_NAME"
+else
+    field_plain 'GPU' "$GPU_NAME" "$RED"
+fi
+
+if [[ $GPU_TEMP_VALUE != 'N/D' ]]; then
+    field_plain 'GPU Temp' "$GPU_TEMP_VALUE" "$(temp_color "${GPU_TEMP_VALUE%% *}")"
+else
+    field_plain 'GPU Temp' "$GPU_TEMP_VALUE" "$DIM"
+fi
+
+if [[ $GPU_POWER != 'N/D' ]]; then
+    field_plain 'GPU Power' "$GPU_POWER"
+else
+    field_plain 'GPU Power' "$GPU_POWER" "$DIM"
+fi
+
+if [[ -n $DISK_PCT ]]; then
+    field_plain 'Disco' "$DISK_VALUE" "$(pct_color "$DISK_PCT")"
+else
+    field_plain 'Disco' "$DISK_VALUE" "$DIM"
+fi
+
+field_plain 'Uptime' "$UPTIME_VALUE"
+
+print_section 'SERVICIOS'
+
+if vast_is_active; then
+    status_line 'Vast.ai' up 'ONLINE'
+else
+    status_line 'Vast.ai' down 'OFFLINE'
+fi
+
+if docker_is_active; then
+    status_line 'Docker' up 'ACTIVE'
+else
+    status_line 'Docker' down 'STOPPED'
+fi
+
+if nvidia_is_detected; then
+    status_line 'NVIDIA' up 'DETECTED'
+else
+    status_line 'NVIDIA' down 'NOT FOUND'
+fi
+
+exit 0
